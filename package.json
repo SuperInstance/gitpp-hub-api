@@ -1,0 +1,17 @@
+{
+  "name": "gitpp-hub-api",
+  "version": "0.1.0",
+  "description": "Portable HTTP API for the git.pp hub. Single file, no deps.",
+  "type": "module",
+  "main": "server.mjs",
+  "scripts": {
+    "start": "node server.mjs",
+    "dev": "node server.mjs"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "files": ["server.mjs", "src/"],
+  "keywords": ["git.pp", "quilt", "hub", "api", "fold"],
+  "license": "MIT"
+}
