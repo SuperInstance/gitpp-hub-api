@@ -1,0 +1,291 @@
+openapi: 3.1.0
+info:
+  title: gitpp-hub-api
+  version: 0.1.0
+  description: |
+    HTTP API for the git.pp hub. The write-side counterpart to gitpp-fold-edge.
+    Adds records, validates them, computes the digest, stores them, and exposes
+    the fold. No DB, no framework, no auth (add a reverse proxy for production).
+  contact:
+    name: Casey Digennaro
+    url: https://github.com/SuperInstance/gitpp-hub-api
+servers:
+  - url: http://localhost:8788
+    description: Local dev
+  - url: https://{host}
+    description: Self-hosted
+    variables:
+      host:
+        default: gitpp.example.com
+paths:
+  /health:
+    get:
+      summary: Health check
+      responses:
+        "200":
+          description: Healthy
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean, const: true }
+  /version:
+    get:
+      summary: API version
+      responses:
+        "200":
+          description: Version info
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  name: { type: string }
+                  version: { type: string }
+                  sha: { type: string }
+  /projects:
+    get:
+      summary: List projects
+      responses:
+        "200":
+          description: Project list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  projects:
+                    type: array
+                    items: { type: string }
+    post:
+      summary: Create a project
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name: { type: string, minLength: 1 }
+      responses:
+        "201":
+          description: Project created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  name: { type: string }
+                  records: { type: integer, minimum: 0 }
+  /projects/{project}:
+    parameters:
+      - { name: project, in: path, required: true, schema: { type: string } }
+    get:
+      summary: Project info
+      responses:
+        "200":
+          description: Info
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  name: { type: string }
+                  records: { type: integer, minimum: 0 }
+  /projects/{project}/records:
+    parameters:
+      - { name: project, in: path, required: true, schema: { type: string } }
+    get:
+      summary: List records
+      parameters:
+        - { name: after, in: query, schema: { type: string }, description: "ID to paginate after (exclusive)" }
+        - { name: limit, in: query, schema: { type: integer, default: 1000 } }
+      responses:
+        "200":
+          description: Records
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  records:
+                    type: array
+                    items: { $ref: "#/components/schemas/Record" }
+                  total: { type: integer }
+    post:
+      summary: Add a record
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - $ref: "#/components/schemas/Record"
+                - type: object
+                  properties:
+                    record: { $ref: "#/components/schemas/Record" }
+                  required: [record]
+      responses:
+        "201":
+          description: Record added
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id: { type: string }
+                  leaf: { type: string, pattern: "^[a-f0-9]{64}$" }
+        "409": { description: "Record already exists" }
+        "422": { description: "Invalid record" }
+  /projects/{project}/records/{id}:
+    parameters:
+      - { name: project, in: path, required: true, schema: { type: string } }
+      - { name: id, in: path, required: true, schema: { type: string } }
+    get:
+      summary: Get a record (with computed leaf)
+      responses:
+        "200":
+          description: The record
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  record: { $ref: "#/components/schemas/Record" }
+                  leaf: { type: string, pattern: "^[a-f0-9]{64}$" }
+        "404": { description: "Record not found" }
+  /projects/{project}/fold:
+    parameters:
+      - { name: project, in: path, required: true, schema: { type: string } }
+    post:
+      summary: Fold the project's record set
+      responses:
+        "200":
+          description: Fold result
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/FoldResult" }
+  /projects/{project}/verify:
+    parameters:
+      - { name: project, in: path, required: true, schema: { type: string } }
+    post:
+      summary: Verify a checkpoint
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [checkpoint]
+              properties:
+                checkpoint: { $ref: "#/components/schemas/Checkpoint" }
+      responses:
+        "200":
+          description: Verdict
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/VerifyResult" }
+  /projects/{project}/root:
+    parameters:
+      - { name: project, in: path, required: true, schema: { type: string } }
+    post:
+      summary: Compute closure root at a record
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [at]
+              properties:
+                at: { type: string }
+      responses:
+        "200":
+          description: Closure root
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  root: { type: string, pattern: "^[a-f0-9]{64}$" }
+components:
+  schemas:
+    Record:
+      type: object
+      required: [id, kind, parents, effects, reason]
+      properties:
+        id: { type: string, minLength: 1 }
+        kind:
+          type: string
+          enum: [task, witness, override]
+        parents:
+          type: array
+          items: { type: string }
+        effects:
+          type: object
+          additionalProperties: true
+        reason:
+          type: [string, "null"]
+        digest:
+          type: string
+          pattern: "^[a-f0-9]{64}$"
+          description: "v2 dialect: SHA-256 of the canonical form (runner writes, worker verifies)"
+    FoldResult:
+      type: object
+      required: [state, order, conflicts, orphans]
+      properties:
+        state:
+          type: object
+          additionalProperties: true
+        order:
+          type: array
+          items: { type: string }
+        conflicts:
+          type: array
+          items:
+            type: object
+            properties:
+              key: { type: string }
+              winner: { type: string }
+              losers:
+                type: array
+                items: { type: string }
+        orphans:
+          type: array
+          items:
+            type: object
+            properties:
+              id: { type: string }
+              kind: { type: string }
+              missingParents:
+                type: array
+                items: { type: string }
+    Checkpoint:
+      type: object
+      required: [at, state, closureRoot]
+      properties:
+        at: { type: string }
+        state:
+          type: object
+          additionalProperties: true
+        closureRoot: { type: string, pattern: "^[a-f0-9]{64}$" }
+    VerifyResult:
+      type: object
+      required: [verdict, closureRoot, state]
+      properties:
+        verdict:
+          type: string
+          enum: [VERIFIED, STATE-ONLY, MISMATCH]
+        closureRoot: { type: string }
+        expectedRoot:
+          type: [string, "null"]
+        state:
+          type: object
+          additionalProperties: true
+        stateDiff:
+          type: object
+          properties:
+            onlyInLive: { type: object, additionalProperties: true }
+            onlyInExpected: { type: object, additionalProperties: true }
