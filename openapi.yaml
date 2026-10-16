@@ -156,6 +156,97 @@ paths:
                   record: { $ref: "#/components/schemas/Record" }
                   leaf: { type: string, pattern: "^[a-f0-9]{64}$" }
         "404": { description: "Record not found" }
+  /projects/{project}/nudge:
+    parameters:
+      - { name: project, in: path, required: true, schema: { type: string } }
+    post:
+      summary: Propose a nudge through the gate
+      description: |
+        A nudge is a DECISION and an ACTION, and the action's parent is the
+        decision record. Two records are written, parented:
+
+            t1  task, status=wip
+             |
+            receipt-N  witness, effects:{}, reason="gate:<verdict>"   <- decision
+             |
+            nudge-N   task, status=done                               <- action
+
+        If the gate blocks, ONLY the receipt is written: state does not
+        move, but the attempt is on the record permanently and
+        tamper-evidently. Because the action is parented on the receipt,
+        deleting the receipt makes the action an orphan whose closure root
+        is null -- you cannot hold an action without the decision that
+        licensed it.
+
+        The parent check is exact and offline (parents[0] === setters[key]).
+        The intent check is a calibrated structured decision and is
+        OPTIONAL; with no signal the gate fails CLOSED.
+
+        Measured routing:
+          no intent signal  -> block   (receipt only, stateUnchanged)
+          intent < threshold -> review (receipt only)
+          intent >= threshold -> act   (action written, landed:true)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [key, value]
+              properties:
+                key:    { type: string }
+                value:  {}
+                reason: { type: string }
+                kind:   { type: string, enum: [task, witness, override] }
+                intent:
+                  type: number
+                  minimum: 0
+                  maximum: 1
+                  description: >
+                    Calibrated probability that this nudge is well-founded.
+                    Omit for a parent-only gate, which still fails closed.
+                dryRun:
+                  type: boolean
+                  description: Evaluate and report without persisting.
+      responses:
+        "201":
+          description: Routed; acted, reviewed, or blocked
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  routed: { type: string, enum: [act, review, block] }
+                  reason: { type: string }
+                  receipt: { $ref: "#/components/schemas/Record" }
+                  action:
+                    oneOf:
+                      - { $ref: "#/components/schemas/Record" }
+                      - { type: "null" }
+                  landed:
+                    type: boolean
+                    description: >
+                      True only if this action IS the setter. Not "the value
+                      matches" -- a lower-class nudge carrying the same value
+                      would satisfy that, and would be wrong.
+                  setterNow: { type: [string, "null"] }
+                  state: { type: object, additionalProperties: true }
+                  dryRun: { type: boolean }
+        "202":
+          description: >
+            Blocked before the action. The receipt is persisted and the
+            state is unchanged.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  routed: { type: string, const: block }
+                  reason: { type: string }
+                  receipt: { $ref: "#/components/schemas/Record" }
+                  action: { type: "null" }
+                  stateUnchanged: { type: boolean, const: true }
+        "400": { description: "missing 'key' or 'value'" }
   /projects/{project}/fold:
     parameters:
       - { name: project, in: path, required: true, schema: { type: string } }
@@ -234,11 +325,19 @@ components:
           description: "v2 dialect: SHA-256 of the canonical form (runner writes, worker verifies)"
     FoldResult:
       type: object
-      required: [state, order, conflicts, orphans]
+      required: [state, setters, order, conflicts, orphans]
       properties:
         state:
           type: object
           additionalProperties: true
+        setters:
+          type: object
+          additionalProperties: { type: string }
+          description: >
+            Spec 5.6: which record sets each key, for EVERY key in state,
+            not only contested ones. This is what makes a nudge reliably
+            authorable -- parent on setters[key] and it lands, whatever
+            the nudge id sorts as.
         order:
           type: array
           items: { type: string }
