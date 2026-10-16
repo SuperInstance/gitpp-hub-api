@@ -288,6 +288,7 @@ export function derive(records) {
   const state = {};
   const conflicts = [];
   const keys = new Set();
+  const stateKeys = keys;
   for (const r of applied.values()) {
     for (const k of Object.keys(r.effects || {})) keys.add(k);
   }
@@ -339,11 +340,52 @@ export function derive(records) {
     }
   }
 
+  // Spec §5.6: setter for every key in state, not only contested ones.
+  // The fold computes the winner above and was discarding it, which left a
+  // same-class nudge parented on the wrong record landing or vanishing
+  // depending only on whether its own id sorted before the winner's.
+  const setters = {};
+  for (const r of applied.values()) {
+    for (const k of Object.keys(r.effects || {})) setters[k] = k in state ? setters[k] : undefined;
+  }
+  // Walk state in the same order the resolution assigned, recording the winner.
+  {
+    const winnerOf = new Map();
+    for (const K of stateKeys) {
+      const cands = [...applied.values()].filter((r) => K in (r.effects || {}));
+      if (!cands.length) continue;
+      const top = Math.max(...cands.map((r) => CLASS_RANK[r.kind] || 0));
+      const same = cands.filter((r) => (CLASS_RANK[r.kind] || 0) === top);
+      const anc = new Map();
+      for (const r of same) anc.set(r.id, ancestorsOf(r.id, applied));
+      const surv = same.filter((r) => !same.some((o) => o.id !== r.id && anc.get(o.id).has(r.id)));
+      let w = surv[0];
+      if (surv.length > 1) {
+        const aIntent = (x) => [...anc.get(x)].filter((y) => applied.get(y) && (CLASS_RANK[applied.get(y).kind] || 0) >= 2).length;
+        const aWitness = (x) => [...anc.get(x)].filter((y) => applied.get(y) && CLASS_RANK[applied.get(y).kind] === 1).length;
+        w = [...surv].sort((a, b) => {
+          const d = aIntent(b.id) - aIntent(a.id); if (d) return d;
+          const e = aWitness(a.id) - aWitness(b.id); if (e) return e;
+          return sortByCodePoint([a.id, b.id])[0] === a.id ? -1 : 1;
+        })[0];
+      }
+      winnerOf.set(K, w.id);
+    }
+    for (const [k, v] of winnerOf) setters[k] = v;
+  }
+
   return {
     state,
+    setters,
     order,
     conflicts,
-    orphans: sortByCodePoint([...orphans].filter(x => typeof x === "string")),
+    // Cycle-affected records are excluded from the fold (above) AND must be
+    // preserved in the output per spec §5.5. Previously `cycles` was computed
+    // and used to exclude records from `applied`, but never surfaced here, so
+    // a 2-cycle silently vanished from the result. (gitpp-js v0.1.4)
+    orphans: sortByCodePoint(
+      [...new Set([...orphans, ...cycles])].filter(x => typeof x === "string")
+    ),
   };
 }
 

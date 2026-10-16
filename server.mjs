@@ -25,6 +25,51 @@ import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { recordLeaf, derive, verifyCheckpoint, closureRoot } from "./src/gitpp.js";
 
+// ---------------------------------------------------------------- gating
+// A nudge is not just a record. It is a DECISION (which the gate routes)
+// followed by an ACTION, and the action's parent IS the decision record --
+// so the action's closure root cannot exist without it. If you delete the
+// receipt, the action becomes an orphan and its root becomes null. See
+// gitpp-decision-parent, where that shape was measured rather than assumed
+// (the receipt-after-action shape does NOT work, and this comment exists so
+// nobody re-derives it the wrong way round).
+const GATE = {
+  threshold: parseFloat(process.env.GITPP_GATE_THRESHOLD || "0.80"),
+  // Fail closed. No signal is never consent.
+  onMissing: "block",
+};
+
+/** The parent check is decidable, so it is decided in code, not by a model. */
+function parentIsCorrect(folded, key, proposedParent) {
+  const expected = folded?.setters?.[key] ?? null;
+  return { ok: proposedParent === expected, expected, actual: proposedParent ?? null };
+}
+
+/**
+ * Route a proposed nudge. The parent check is exact and offline. The intent
+ * check is a calibrated structured decision (TypeSafe Jev) and is OPTIONAL:
+ * with no key configured, the gate runs parent-only and that is honest, not
+ * fail-open, because the parent check is the one that can be wrong in a way
+ * that silently discards the nudge.
+ */
+function route({ folded, key, record, intent }) {
+  const chk = parentIsCorrect(folded, key, record.parents?.[0]);
+  if (!chk.ok) {
+    return { action: "block", reason: `parent ${chk.actual} is not the setter ${chk.expected}`, parent: chk, intent: null };
+  }
+  if (intent === undefined || intent === null) {
+    return {
+      action: GATE.onMissing === "block" ? "block" : "review",
+      reason: "no intent signal (no gate key configured)",
+      parent: chk, intent: null,
+    };
+  }
+  if (intent < GATE.threshold) {
+    return { action: "review", reason: `should_apply=${intent} below ${GATE.threshold}`, parent: chk, intent };
+  }
+  return { action: "act", reason: "all gates clear", parent: chk, intent };
+}
+
 const NAME = "gitpp-hub-api";
 const VERSION = "0.1.0";
 const SHA = "fc1fbb9";
@@ -69,6 +114,17 @@ function listProjects() {
 function json(data, status = 200, extra = {}) {
   return { status, headers: { "content-type": "application/json", "access-control-allow-origin": "*", ...extra }, body: JSON.stringify(data, null, 2) };
 }
+// json() RETNS a response description; it does not write to the socket.
+// Every handler must end with `respond(res, json(...), )` or res.end() is
+// never called and the request hangs until the client times out. The nudge
+// handler shipped doing `return json(...)` for exactly this reason, which
+// looked like an infinite loop in the fold and was nothing of the kind.
+function respond(res, r) {
+  res.statusCode = r.status;
+  Object.entries(r.headers).forEach(([k, v]) => res.setHeader(k, v));
+  return res.end(r.body);
+}
+
 function err(message, status = 400) { return json({ error: message }, status); }
 function html(s) { return { status: 200, headers: { "content-type": "text/html; charset=utf-8" }, body: s }; }
 
@@ -188,7 +244,7 @@ async function handle(req, res) {
       return res.end(r.body);
     }
 
-    const projectMatch = path.match(/^\/projects\/([^\/]+)(?:\/(records|fold|verify|root))?(?:\/(.*))?$/);
+    const projectMatch = path.match(/^\/projects\/([^\/]+)(?:\/(records|fold|verify|root|nudge))?(?:\/(.*))?$/);
     if (projectMatch) {
       const projectName = projectMatch[1];
       const sub = projectMatch[2];
@@ -241,6 +297,88 @@ async function handle(req, res) {
         const r = json({ record, leaf });
         res.statusCode = r.status; Object.entries(r.headers).forEach(([k, v]) => res.setHeader(k, v));
         return res.end(r.body);
+      }
+
+      if (sub === "nudge" && method === "POST") {
+        // POST /projects/:p/nudge
+        //   { key, value, reason, kind?, intent?, dryRun? }
+        //
+        // A nudge is a decision plus an action, and the action's parent IS
+        // the decision record. Written as two records, parented. If the gate
+        // blocks, ONLY the receipt is written: the state does not move, but
+        // the attempt is on the record permanently and tamper-evidently.
+        const body = await parseBody(req);
+        if (!body.key) return sendErr(res, "missing 'key'");
+        if (!("value" in body)) return sendErr(res, "missing 'value'");
+
+        const current = Array.from(project.records.values());
+        const folded = derive(current);
+        const seq = current.length + 1;
+        const receiptId = `receipt-${String(seq).padStart(4, "0")}`;
+        const actionId = `nudge-${String(seq).padStart(4, "0")}`;
+
+        // The receipt is parented on the CURRENT setter of the key, and the
+        // action is parented on the RECEIPT. effects:{} so it is state-inert
+        // (SS5.2 iterates the keys a record SETS). kind:witness, the lowest
+        // class, so it can never outrank anything even if the enum widens.
+        const receipt = {
+          id: receiptId,
+          kind: "witness",
+          parents: folded.setters?.[body.key] ? [folded.setters[body.key]] : [],
+          effects: {},
+          reason: "gate:pending",
+        };
+        const action = {
+          id: actionId,
+          kind: body.kind || folded.setters?.[body.key]
+            ? (current.find((r) => r.id === folded.setters[body.key])?.kind || "task")
+            : "task",
+          parents: [receiptId],
+          effects: { [body.key]: body.value },
+          reason: body.reason || `nudge ${body.key}`,
+        };
+
+        // Gate the RECEIPT. Its parent is the current setter of the key --
+        // that is the relationship worth checking. The ACTION's parent is the
+        // receipt, which is structural by construction and can never match
+        // setters[key]; checking it would block every nudge forever.
+        const decision = route({
+          folded, key: body.key, record: receipt,
+          intent: body.intent ?? null,
+        });
+        receipt.reason = `gate:${decision.action} ${decision.reason}`;
+
+        if (decision.action === "block") {
+          // Write the RECEIPT ONLY. State does not move; the attempt is
+          // recorded and the closure root of the RECEIPT commits to it.
+          receipt.digest = await recordLeaf(receipt);
+          project.records.set(receipt.id, receipt);
+          saveProject(projectName, project);
+          return respond(res, json({ routed: decision.action, reason: decision.reason,
+                        receipt, action: null, stateUnchanged: true }, 202));
+        }
+
+        receipt.digest = await recordLeaf(receipt);
+        action.digest = await recordLeaf(action);
+        project.records.set(receipt.id, receipt);
+        project.records.set(action.id, action);
+        saveProject(projectName, project);
+
+        // Verify AFTER the fact, by setter identity -- not by "the value
+        // matches", which two different records can both satisfy.
+        const after = derive(Array.from(project.records.values()));
+        const landed = after.setters?.[body.key] === actionId;
+
+        if (body.dryRun) {
+          project.records.delete(receipt.id);
+          project.records.delete(action.id);
+          saveProject(projectName, project);
+        }
+        return respond(res, json({
+          routed: decision.action, reason: decision.reason,
+          receipt, action, landed, setterNow: after.setters?.[body.key] ?? null,
+          state: after.state, dryRun: Boolean(body.dryRun),
+        }, 201));
       }
 
       if (sub === "fold" && method === "POST") {
